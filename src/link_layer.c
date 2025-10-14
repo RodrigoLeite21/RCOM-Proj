@@ -8,13 +8,14 @@
 #include <unistd.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 #define _POSIX_SOURCE 1
 
 // Basic frame constants
 #define FLAG 0x7E
 #define A_TX 0x03
-#define A_RX 0x01  
+#define A_RX 0x01
 
 #define C_SET 0x03
 #define C_UA  0x07
@@ -40,32 +41,28 @@
 
 // Globals
 volatile int STOP = 0;
-static volatile sig_atomic_t alarm_active = 0;
-static volatile sig_atomic_t alarm_count = 0;
+static volatile sig_atomic_t alarm_fired = 0;
 
 static int g_role = 0;
 static int g_timeout = 0;
 static int g_nretrans = 0;
-static unsigned char g_tx_ns = 0;      
-static unsigned char g_rx_expected = 0;
+static uint8_t g_tx_ns = 0;      
+static uint8_t g_rx_expected = 0;
 
-// Alarm handler used for retransmissions
+// Alarm handler used for retransmissions -- async-signal-safe (only sets flag)
 static void alarm_handler(int signo) {
     (void)signo;
-    alarm_active = 0;
-    alarm_count++;
-    fprintf(stderr, "Alarm #%d fired (timeout)\n", alarm_count);
+    alarm_fired = 1;
 }
 
-
 // Compute BCC1 = A ^ C
-static unsigned char bcc1(unsigned char A, unsigned char C) {
-    return (unsigned char)(A ^ C);
+static uint8_t bcc1(uint8_t A, uint8_t C) {
+    return (uint8_t)(A ^ C);
 }
 
 // Compute BCC2 
-static unsigned char bcc2(const unsigned char *buf, int len) {
-    unsigned char x = 0x00;
+static uint8_t bcc2(const uint8_t *buf, int len) {
+    uint8_t x = 0x00;
     for (int i = 0; i < len; ++i) x ^= buf[i];
     return x;
 }
@@ -104,7 +101,7 @@ static int destuff(const unsigned char *in, int inlen, unsigned char *out, int o
 }
 
 // Write a supervision frame: FLAG A C BCC FLAG
-static int send_su(unsigned char A_field, unsigned char C_field) {
+static int send_su(uint8_t A_field, uint8_t C_field) {
     unsigned char f[5];
     f[0] = FLAG; f[1] = A_field; f[2] = C_field; f[3] = bcc1(A_field, C_field); f[4] = FLAG;
     int w = writeBytesSerialPort(f, 5);
@@ -113,8 +110,7 @@ static int send_su(unsigned char A_field, unsigned char C_field) {
 
 // Read a supervision frame (blocking): expects FLAG A ? C BCC FLAG with specified A_field
 // Returns C (control) in *Cout and 0 on success, -1 on error.
-// This is a linear state machine similar to your original style.
-static int read_su(unsigned char expectedA, unsigned char *Cout) {
+static int read_su(uint8_t expectedA, uint8_t *Cout) {
     enum { ST_START, ST_FLAG, ST_A, ST_C, ST_BCC } st = ST_START;
     unsigned char b;
     unsigned char A = 0, C = 0, B = 0;
@@ -136,7 +132,7 @@ static int read_su(unsigned char expectedA, unsigned char *Cout) {
                 B = b; st = ST_BCC; break;
             case ST_BCC:
                 if (b == FLAG) {
-                    if (B == (unsigned char)(A ^ C)) {
+                    if (B == (uint8_t)(A ^ C)) {
                         if (Cout) *Cout = C;
                         return 0;
                     } else {
@@ -154,7 +150,7 @@ static int read_su(unsigned char expectedA, unsigned char *Cout) {
 // Read an I-frame: expects FLAG A C BCC1 [stuffed DATA + stuffed BCC2] FLAG
 // On success: writes destuffed payload into 'out' (up to outcap) and sets *Cout to C, returns payload length
 // Returns -1 on framing/BCC errors.
-static int read_iframe(unsigned char expectedA, unsigned char *Cout, unsigned char *out, int outcap) {
+static int read_iframe(uint8_t expectedA, uint8_t *Cout, unsigned char *out, int outcap) {
     unsigned char b;
     while (1) {
         int r = readByteSerialPort(&b);
@@ -204,8 +200,7 @@ static int read_iframe(unsigned char expectedA, unsigned char *Cout, unsigned ch
 ////////////////////////////////////////////////
 int llopen(LinkLayer connectionParameters) {
     STOP = 0;
-    alarm_active = 0;
-    alarm_count = 0;
+    alarm_fired = 0;
 
     if (openSerialPort(connectionParameters.serialPort, connectionParameters.baudRate) < 0) {
         perror("openSerialPort");
@@ -234,40 +229,37 @@ int llopen(LinkLayer connectionParameters) {
         unsigned char set[5] = {FLAG, A_TX, C_SET, bcc1(A_TX, C_SET), FLAG};
 
         int tries = 0;
-        alarm_active = 0;
-        alarm_count = 0;
 
         while (tries < g_nretrans) {
-            if (!alarm_active) {
-                if (writeBytesSerialPort(set, 5) != 5) {
-                    closeSerialPort(); return -1;
-                }
-                alarm(g_timeout);
-                alarm_active = 1;
+            alarm_fired = 0;
+            if (writeBytesSerialPort(set, 5) != 5) {
+                closeSerialPort(); return -1;
             }
+            alarm(g_timeout);
 
             unsigned char rC = 0;
             int res = read_su(A_TX, &rC);
             if (res == 0) {
                 if (rC == C_UA) {
+                    alarm(0);
+                    alarm_fired = 0;
                     printf("UA received\nLink opened successfully.\n\n");
-                    alarm(0); 
-                    alarm_active = 0;
                     g_tx_ns = 0;
                     g_rx_expected = 0;
                     return 0;
                 } else {
                     continue;
                 }
-            }
-
-            if (!alarm_active) {
-                tries++;
-                printf("Timeout, retransmitting SET (try %d)...\n", tries);
             } else {
+                if (alarm_fired) {
+                    tries++;
+                    alarm(0);
+                    alarm_fired = 0;
+                    printf("Timeout, retransmitting SET (try %d)...\n", tries);
+                    continue;
+                }
                 tries++;
-                alarm(0);
-                alarm_active = 0;
+                continue;
             }
         }
         closeSerialPort();
@@ -308,27 +300,17 @@ int llwrite(const unsigned char *buf, int bufSize) {
     frame[pos++] = C;
     frame[pos++] = bcc1(A_TX, C);
 
+    unsigned char payload_with_bcc[MAX_PAYLOAD_SIZE + 1];
+    memcpy(payload_with_bcc, buf, bufSize);
+    payload_with_bcc[bufSize] = bcc2(buf, bufSize);
+    int pwlen = bufSize + 1;
+
     unsigned char stuffed[MAX_FRAME_SIZE];
-    int stuffed_len = stuff(buf, bufSize, stuffed, sizeof(stuffed));
+    int stuffed_len = stuff(payload_with_bcc, pwlen, stuffed, sizeof(stuffed));
     if (stuffed_len < 0) return -1;
-    if (pos + stuffed_len >= (int)sizeof(frame) - 4) return -1;
+    if (pos + stuffed_len >= (int)sizeof(frame) - 2) return -1;
     memcpy(frame + pos, stuffed, stuffed_len);
     pos += stuffed_len;
-
-    unsigned char b2 = bcc2(buf, bufSize);
-    unsigned char b2_stuff[2];
-    int b2len = 0;
-    if (b2 == FLAG || b2 == ESC) {
-        b2_stuff[0] = ESC;
-        b2_stuff[1] = b2 ^ ESC_XOR;
-        b2len = 2;
-    } else {
-        b2_stuff[0] = b2;
-        b2len = 1;
-    }
-    if (pos + b2len >= (int)sizeof(frame) - 2) return -1;
-    memcpy(frame + pos, b2_stuff, b2len);
-    pos += b2len;
 
     frame[pos++] = FLAG;
 
@@ -338,53 +320,53 @@ int llwrite(const unsigned char *buf, int bufSize) {
     if (sigaction(SIGALRM, &act, NULL) == -1) return -1;
 
     int attempts = 0;
-    alarm_active = 0;
-    alarm_count = 0;
 
     while (attempts < g_nretrans) {
-        if (!alarm_active) {
-            int w = writeBytesSerialPort(frame, pos);
-            if (w != pos) return -1;
-            alarm(g_timeout);
-            alarm_active = 1;
-        }
+        alarm_fired = 0;
+        if (writeBytesSerialPort(frame, pos) != pos) return -1;
+        alarm(g_timeout);
 
         unsigned char rc = 0;
         int r = read_su(A_RX, &rc);
         if (r == 0) {
-            // got a supervision frame
             if (rc == C_RR0 || rc == C_RR1) {
                 unsigned char nr = (rc == C_RR1) ? 1 : 0;
-                if (nr == (unsigned char)(g_tx_ns ^ 1)) {
-                    alarm(0); alarm_active = 0;
+                if (nr == (uint8_t)(g_tx_ns ^ 1)) {
+                    alarm(0);
+                    alarm_fired = 0;
                     g_tx_ns ^= 1;
                     return bufSize;
                 } else {
+
                     continue;
                 }
             } else if (rc == C_REJ0 || rc == C_REJ1) {
                 attempts++;
-                alarm(0); alarm_active = 0;
+                alarm(0);
+                alarm_fired = 0;
+                printf("Received REJ -> retransmitting (attempt %d)\n", attempts);
                 continue;
             } else if (rc == C_DISC) {
-                alarm(0); alarm_active = 0;
+                alarm(0);
+                alarm_fired = 0;
                 return -1;
             } else {
                 continue;
             }
-        }
-
-        if (!alarm_active) {
-            attempts++;
-            continue;
         } else {
+            if (alarm_fired) {
+                attempts++;
+                alarm(0);
+                alarm_fired = 0;
+                printf("Timeout while waiting for RR/REJ -> retransmit (attempt %d)\n", attempts);
+                continue;
+            }
             attempts++;
-            alarm(0); alarm_active = 0;
             continue;
         }
     }
 
-    alarm(0); alarm_active = 0;
+    alarm(0); alarm_fired = 0;
     return -1;
 }
 
@@ -407,12 +389,14 @@ int llread(unsigned char *packet) {
         unsigned char ns = (C & 0x80) ? 1 : 0;
 
         if (ns == g_rx_expected) {
-            unsigned char rr = (g_rx_expected ^ 1) ? C_RR1 : C_RR0;
+            // send RR acknowledging next expected sequence
+            unsigned char rr = (g_rx_expected ^ 1) ? C_RR1 : C_RR0; // clearer: N(R) == g_rx_expected ^ 1
             if (send_su(A_RX, rr) < 0) return -1;
             g_rx_expected ^= 1;
             if (n > 0) memcpy(packet, local, n);
             return n;
         } else {
+            // duplicate frame: re-send last RR (acknowledge already received sequence)
             unsigned char rr = (g_rx_expected) ? C_RR1 : C_RR0;
             if (send_su(A_RX, rr) < 0) return -1;
             return 0;
@@ -437,13 +421,11 @@ int llclose() {
         // Initiator of close: send DISC, wait DISC from peer, then send UA
         unsigned char disc[5] = {FLAG, A_TX, C_DISC, bcc1(A_TX, C_DISC), FLAG};
         int attempts = 0;
-        alarm_active = 0; alarm_count = 0;
         while (attempts < g_nretrans) {
-            if (!alarm_active) {
-                if (writeBytesSerialPort(disc, 5) != 5) { closeSerialPort(); return -1; }
-                alarm(g_timeout);
-                alarm_active = 1;
-            }
+            alarm_fired = 0;
+            if (writeBytesSerialPort(disc, 5) != 5) { closeSerialPort(); return -1; }
+            alarm(g_timeout);
+
             unsigned char rc = 0;
             int r = read_su(A_RX, &rc);
             if (r == 0 && rc == C_DISC) {
@@ -452,12 +434,17 @@ int llclose() {
                 closeSerialPort();
                 return 0;
             }
-            if (!alarm_active) {
+
+            if (alarm_fired) {
+                attempts++;
+                alarm(0);
+                alarm_fired = 0;
+                continue;
+            }
+
+            if (r < 0) {
                 attempts++;
                 continue;
-            } else {
-                attempts++;
-                alarm(0); alarm_active = 0;
             }
         }
         printf("DISC received -> sending UA\nSerial port closed\nLink closed successfully.\n");
@@ -479,7 +466,6 @@ int llclose() {
             int r = read_su(A_RX, &rc);
             if (r < 0) continue;
             if (rc == C_UA) break;
-            printf("Serial port closed\nLink closed successfully.\n");
         }
         closeSerialPort();
         return 0;
