@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <arpa/inet.h>
+#include <stdbool.h> 
 
 #define DATA_PACKET 1
 #define START_PACKET 2
@@ -96,6 +97,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
 
         unsigned char packet[1024];
 
+        printf("Sending START packet...\n");
         int packetSize = build_control_packet(packet, START_PACKET, filename, fileSize);
         if (llwrite(packet, packetSize) < 0) {
             fprintf(stderr, "Error: Failed to send START packet\n");
@@ -107,12 +109,12 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         unsigned char dataBuffer[512];
         int seq = 0;
         size_t bytesRead;
+        bool error = false;
 
         while ((bytesRead = fread(dataBuffer, 1, sizeof(dataBuffer), file)) > 0)
         {
             unsigned char dataPacket[4 + sizeof(dataBuffer)];
             int index = 0;
-
             dataPacket[index++] = DATA_PACKET;
             dataPacket[index++] = (uint8_t)(seq % 256);
             dataPacket[index++] = (uint8_t)((bytesRead >> 8) & 0xFF);
@@ -124,18 +126,23 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
             if (llwrite(dataPacket, index) == -1)
             {
                 fprintf(stderr, "Error: Failed to send data packet\n");
+                error = true;
                 break;
             }
-
             seq++;
         }
 
+        printf("Sending END packet...\n");
         packetSize = build_control_packet(packet, END_PACKET, filename, fileSize);
         llwrite(packet, packetSize);
 
         fclose(file);
-        printf("File '%s' sent successfully (%u bytes)\n", filename, fileSize);
-    }
+        if (!error){
+            printf("File '%s' sent successfully (%u bytes)\n\n", filename, fileSize);
+        } else {
+            fprintf(stderr, "File transmission failed! File sent was incomplete.\n\n");
+        }
+    }    
     else
     {
         FILE *file = fopen(filename, "wb");
@@ -164,7 +171,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
 
             if (control == START_PACKET)
             {
-                printf("Start packet received.\n");
+                printf("START packet received.\n");
             }
             else if (control == DATA_PACKET)
             {
@@ -173,13 +180,13 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
             }
             else if (control == END_PACKET)
             {
-                printf("End packet received.\n");
+                printf("END packet received.\n");
                 receiving = 0;
             }
         }
 
         fclose(file);
-        printf("File '%s' received successfully.\n", filename);
+        printf("File '%s' received successfully.\n\n", filename);
     }
 
     printf("--- Closing link ---\n");

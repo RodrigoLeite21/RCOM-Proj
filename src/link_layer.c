@@ -1,4 +1,4 @@
-// Link layer protocol implementation
+// Link Layer protocol implementation
 
 #include "link_layer.h"
 #include "serial_port.h"
@@ -108,8 +108,7 @@ static int send_su(uint8_t A_field, uint8_t C_field) {
     return (w == 5) ? 0 : -1;
 }
 
-// Read a supervision frame (blocking): expects FLAG A ? C BCC FLAG with specified A_field
-// Returns C (control) in *Cout and 0 on success, -1 on error.
+// Read a supervision frame (blocking)
 static int read_su(uint8_t expectedA, uint8_t *Cout) {
     enum { ST_START, ST_FLAG, ST_A, ST_C, ST_BCC } st = ST_START;
     unsigned char b;
@@ -147,11 +146,22 @@ static int read_su(uint8_t expectedA, uint8_t *Cout) {
     return -1;
 }
 
-// Read an I-frame: expects FLAG A C BCC1 [stuffed DATA + stuffed BCC2] FLAG
-// On success: writes destuffed payload into 'out' (up to outcap) and sets *Cout to C, returns payload length
-// Returns -1 on framing/BCC errors.
+// Flush extra (for ressincronização)
+static void flush_until_flag() {
+    unsigned char b;
+    int flushCount = 0;
+    do {
+        int r = readByteSerialPort(&b);
+        if (r <= 0) break;
+        flushCount++;
+    } while (b != FLAG && flushCount < 1000); // Limita flushing a 1000 bytes
+}
+
+// Read an I-frame: robusto contra desalinhamento
+// Read an I-frame: robusto contra desalinhamento
 static int read_iframe(uint8_t expectedA, uint8_t *Cout, unsigned char *out, int outcap) {
     unsigned char b;
+    // Procura pelo FLAG inicial
     while (1) {
         int r = readByteSerialPort(&b);
         if (r < 0) return -1;
@@ -163,19 +173,19 @@ static int read_iframe(uint8_t expectedA, uint8_t *Cout, unsigned char *out, int
     int blen = 0;
     while (1) {
         int r = readByteSerialPort(&b);
-        if (r < 0) return -1;
+        if (r < 0) { flush_until_flag(); return -1; }
         if (r == 0) continue;
         if (b == FLAG) break;
-        if (blen >= (int)sizeof(body)) return -1;
+        if (blen >= (int)sizeof(body)) { flush_until_flag(); return -1; }
         body[blen++] = b;
     }
 
-    if (blen < 4) return -1;
+    if (blen < 4) { flush_until_flag(); return -1; }
     unsigned char A = body[0];
     unsigned char C = body[1];
     unsigned char B1 = body[2];
-    if (A != expectedA) return -1;
-    if (B1 != (unsigned char)(A ^ C)) return -1;
+    if (A != expectedA) { flush_until_flag(); return -1; }
+    if (B1 != (unsigned char)(A ^ C)) { flush_until_flag(); return -1; }
 
     int stuffed_len = blen - 3;
     if (stuffed_len < 1) {
@@ -184,12 +194,12 @@ static int read_iframe(uint8_t expectedA, uint8_t *Cout, unsigned char *out, int
     }
     unsigned char destuffed[MAX_FRAME_SIZE];
     int dlen = destuff(body + 3, stuffed_len, destuffed, sizeof(destuffed));
-    if (dlen < 1) return -1;
+    if (dlen < 1) { flush_until_flag(); return -1; }
     int payload_len = dlen - 1; // last byte is BCC2
     unsigned char recv_bcc2 = destuffed[payload_len];
     unsigned char calc_bcc2 = bcc2(destuffed, payload_len);
-    if (calc_bcc2 != recv_bcc2) return -1;
-    if (payload_len > outcap) return -1;
+    if (calc_bcc2 != recv_bcc2) { flush_until_flag(); return -1; }
+    if (payload_len > outcap) { flush_until_flag(); return -1; }
     if (payload_len > 0) memcpy(out, destuffed, payload_len);
     if (Cout) *Cout = C;
     return payload_len;
@@ -206,7 +216,7 @@ int llopen(LinkLayer connectionParameters) {
         perror("openSerialPort");
         return -1;
     }
-    printf("Serial port %s opened\n", connectionParameters.serialPort);
+    printf("Serial port %s opened:\n", connectionParameters.serialPort);
 
     g_role = connectionParameters.role;
     g_timeout = connectionParameters.timeout;
@@ -224,12 +234,10 @@ int llopen(LinkLayer connectionParameters) {
     }
 
     if (g_role == LlTx) {
-        // Transmitter: send SET, wait UA with retransmissions
         printf("Sending SET...\n");
         unsigned char set[5] = {FLAG, A_TX, C_SET, bcc1(A_TX, C_SET), FLAG};
 
         int tries = 0;
-
         while (tries < g_nretrans) {
             alarm_fired = 0;
             if (writeBytesSerialPort(set, 5) != 5) {
@@ -243,7 +251,7 @@ int llopen(LinkLayer connectionParameters) {
                 if (rC == C_UA) {
                     alarm(0);
                     alarm_fired = 0;
-                    printf("UA received\nLink opened successfully.\n\n");
+                    printf("UA received.\nLink opened successfully.\n\n");
                     g_tx_ns = 0;
                     g_rx_expected = 0;
                     return 0;
@@ -265,15 +273,12 @@ int llopen(LinkLayer connectionParameters) {
         closeSerialPort();
         return -1;
     } else {
-        // Receiver: wait SET, reply UA
         while (1) {
             unsigned char rC = 0;
             int res = read_su(A_TX, &rC);
-            if (res < 0) {
-                continue;
-            }
+            if (res < 0) continue;
             if (rC == C_SET) {
-                printf("SET received -> sending UA\n");
+                printf("SET received.\nSending UA...\n");
                 if (send_su(A_TX, C_UA) < 0) {
                     closeSerialPort(); return -1;
                 }
@@ -337,7 +342,6 @@ int llwrite(const unsigned char *buf, int bufSize) {
                     g_tx_ns ^= 1;
                     return bufSize;
                 } else {
-
                     continue;
                 }
             } else if (rc == C_REJ0 || rc == C_REJ1) {
@@ -375,7 +379,7 @@ int llwrite(const unsigned char *buf, int bufSize) {
 ////////////////////////////////////////////////
 int llread(unsigned char *packet) {
     if (!packet) return -1;
-
+    int rejCount = 0;
     while (1) {
         unsigned char C = 0;
         unsigned char local[MAX_PAYLOAD_SIZE + 16];
@@ -383,20 +387,24 @@ int llread(unsigned char *packet) {
         if (n < 0) {
             unsigned char rej = (g_rx_expected == 0) ? C_REJ0 : C_REJ1;
             send_su(A_RX, rej);
+            rejCount++;
+            if (rejCount > 10) {
+                fprintf(stderr, "Too many REJ sent, aborting connection...\n");
+                return -1;
+            }
             continue;
         }
+        rejCount = 0;
 
         unsigned char ns = (C & 0x80) ? 1 : 0;
 
         if (ns == g_rx_expected) {
-            // send RR acknowledging next expected sequence
-            unsigned char rr = (g_rx_expected ^ 1) ? C_RR1 : C_RR0; // clearer: N(R) == g_rx_expected ^ 1
+            unsigned char rr = (g_rx_expected ^ 1) ? C_RR1 : C_RR0;
             if (send_su(A_RX, rr) < 0) return -1;
             g_rx_expected ^= 1;
             if (n > 0) memcpy(packet, local, n);
             return n;
         } else {
-            // duplicate frame: re-send last RR (acknowledge already received sequence)
             unsigned char rr = (g_rx_expected) ? C_RR1 : C_RR0;
             if (send_su(A_RX, rr) < 0) return -1;
             return 0;
@@ -408,7 +416,6 @@ int llread(unsigned char *packet) {
 // LLCLOSE
 ////////////////////////////////////////////////
 int llclose() {
-    // Install alarm handler
     struct sigaction act = {0};
     act.sa_handler = alarm_handler;
     sigemptyset(&act.sa_mask);
@@ -418,56 +425,79 @@ int llclose() {
     }
 
     if (g_role == LlTx) {
-        // Initiator of close: send DISC, wait DISC from peer, then send UA
         unsigned char disc[5] = {FLAG, A_TX, C_DISC, bcc1(A_TX, C_DISC), FLAG};
         int attempts = 0;
+        printf("Sending DISC...\n");
         while (attempts < g_nretrans) {
             alarm_fired = 0;
-            if (writeBytesSerialPort(disc, 5) != 5) { closeSerialPort(); return -1; }
+            if (writeBytesSerialPort(disc, 5) != 5) { 
+                fprintf(stderr, "Failed to send DISC\n");
+                closeSerialPort(); 
+                return -1; 
+            }
             alarm(g_timeout);
 
             unsigned char rc = 0;
             int r = read_su(A_RX, &rc);
             if (r == 0 && rc == C_DISC) {
+                printf("DISC received.\n");
                 unsigned char ua[5] = {FLAG, A_RX, C_UA, bcc1(A_RX, C_UA), FLAG};
-                if (writeBytesSerialPort(ua, 5) != 5) { closeSerialPort(); return -1; }
+                if (writeBytesSerialPort(ua, 5) != 5) { 
+                    fprintf(stderr, "Failed to send UA\n");
+                    closeSerialPort(); 
+                    return -1; 
+                }
+                printf("Sending UA...\n\n");
                 closeSerialPort();
+                printf("Serial port closed.\n");
                 return 0;
             }
-
             if (alarm_fired) {
                 attempts++;
                 alarm(0);
                 alarm_fired = 0;
+                printf("Timeout waiting for DISC, retrying (%d)...\n", attempts);
                 continue;
             }
-
             if (r < 0) {
                 attempts++;
+                printf("Error waiting for DISC, retrying (%d)...\n", attempts);
                 continue;
             }
         }
-        printf("DISC received -> sending UA\nSerial port closed\nLink closed successfully.\n");
+        fprintf(stderr, "Max DISC retries reached; closing anyway\n");
         closeSerialPort();
+        printf("Serial port closed.\n");
         return -1;
     } else {
-        // Wait for DISC from initiator, send DISC, wait UA
         while (1) {
             unsigned char rc = 0;
             int r = read_su(A_TX, &rc);
             if (r < 0) continue;
-            if (rc == C_DISC) break;
+            if (rc == C_DISC) {
+                printf("DISC received.\n");
+                break;
+            }
         }
         unsigned char disc_rx[5] = {FLAG, A_RX, C_DISC, bcc1(A_RX, C_DISC), FLAG};
-        if (writeBytesSerialPort(disc_rx, 5) != 5) { closeSerialPort(); return -1; }
+        if (writeBytesSerialPort(disc_rx, 5) != 5) { 
+            fprintf(stderr, "Failed to send DISC\n");
+            closeSerialPort(); 
+            return -1; 
+        }
+        printf("Sending DISC...\n");
 
         while (1) {
             unsigned char rc = 0;
             int r = read_su(A_RX, &rc);
             if (r < 0) continue;
-            if (rc == C_UA) break;
+            if (rc == C_UA) {
+                printf("UA received.\n\n");
+                break;
+            }
         }
         closeSerialPort();
+        printf("Serial port closed.\n");
         return 0;
     }
 }
