@@ -39,7 +39,6 @@
 #endif
 #define MAX_FRAME_SIZE (2*MAX_PAYLOAD_SIZE + 64)
 
-
 #define FLUSH_LIMIT 10000
 
 // Globals
@@ -51,6 +50,7 @@ static int g_timeout = 0;
 static int g_nretrans = 0;
 static uint8_t g_tx_ns = 0;      
 static uint8_t g_rx_expected = 0;
+static int g_duplicate_count = 0;
 
 // Alarm handler used for retransmissions
 static void alarm_handler(int signo) {
@@ -223,6 +223,7 @@ int llopen(LinkLayer connectionParameters) {
     g_nretrans = connectionParameters.nRetransmissions;
     g_tx_ns = 0;
     g_rx_expected = 0;
+    g_duplicate_count = 0;
 
     struct sigaction act = {0};
     act.sa_handler = alarm_handler;
@@ -404,11 +405,17 @@ int llread(unsigned char *packet) {
             if (send_su(A_RX, rr) < 0) return -1;
             g_rx_expected ^= 1;
             if (n > 0) memcpy(packet, local, n);
+            printf("Frame accepted (seq: %d, size: %d bytes)\n", ns, n);
             return n;
         } else {
+            g_duplicate_count++;
+            printf("Duplicated Frame Detected! Received seq:%d but expected seq:%d\n...", 
+                   g_duplicate_count, ns, g_rx_expected);
+            printf("Discarding duplicate and resending RR%d.\n", g_rx_expected);
+            
             unsigned char rr = (g_rx_expected) ? C_RR1 : C_RR0;
             if (send_su(A_RX, rr) < 0) return -1;
-            return 0;
+            continue;
         }
     }
 }
@@ -493,7 +500,7 @@ int llclose() {
             int r = read_su(A_RX, &rc);
             if (r < 0) continue;
             if (rc == C_UA) {
-                printf("UA received.\n\n");
+                printf("UA received.\n");
                 break;
             }
         }

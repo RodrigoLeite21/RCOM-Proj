@@ -4,6 +4,7 @@
 // Author: Manuel Ricardo [mricardo@fe.up.pt]
 // Modified by: Eduardo Nuno Almeida [enalmeida@fe.up.pt]
 // Modified by: Rui Prior [rcprior@fc.up.pt]
+// Modified to support directional control
 
 #include <fcntl.h>
 #include <math.h>
@@ -35,6 +36,8 @@
 // Current running parameters
 struct Parameters {
     int cableOn;
+    int tx2rxOn;  // NOVO: controla só o sentido Tx -> Rx
+    int rx2txOn;  // NOVO: controla só o sentido Rx -> Tx
     double byteER;   // Byte error rate
     struct timespec byteDelay;
     unsigned long propDelay;   // Desired propagation delay in usec
@@ -50,6 +53,8 @@ struct Parameters {
 
 struct Parameters par = {
     .cableOn = TRUE,
+    .tx2rxOn = TRUE,   // NOVO
+    .rx2txOn = TRUE,   // NOVO
     .byteER = 0.0,
     .propDelay = 0,
     .tx2rx = NULL,
@@ -85,13 +90,11 @@ int openSerialPort(const char *serialPort, struct termios *oldtio, struct termio
     return fd;
 }
 
-
 // Add noise to a buffer, by flipping the byte in the "errorIndex" position.
 void addNoiseToBuffer(unsigned char *buf, size_t errorIndex)
 {
     buf[errorIndex] ^= 0xFF;
 }
-
 
 // Initialize the ring buffers that implement the propagation delay
 // Returns 0 on success, -1 on failure
@@ -122,7 +125,6 @@ int init_ring_buffers(void)
     return 0;
 }
 
-
 // Set the byte delay corresponding to the selected baud rate
 void set_baud_rate(unsigned long baud)
 {
@@ -134,7 +136,6 @@ void set_baud_rate(unsigned long baud)
     init_ring_buffers();
 }
 
-
 // Make the program use RT priority to improve precision in timing
 void set_rt_priority(void) {
     struct sched_param sp = { .sched_priority = 50 };
@@ -142,7 +143,6 @@ void set_rt_priority(void) {
       perror("Could not set realtime priority");
     }
 }
-
 
 // Compute the difference between two timespecs
 struct timespec timespec_diff(const struct timespec *t2, const struct timespec *t1)
@@ -156,7 +156,6 @@ struct timespec timespec_diff(const struct timespec *t2, const struct timespec *
     return diff;
 }
 
-
 // Compute the sum of two timespecs
 struct timespec timespec_sum(const struct timespec *t1, const struct timespec *t2)
 {
@@ -168,7 +167,6 @@ struct timespec timespec_sum(const struct timespec *t1, const struct timespec *t
     }
     return sum;
 }
-
 
 // Compare two timespecs returning -1, 0 or 1 if t1 is less than, equal or
 // greater than t2, respectively
@@ -189,7 +187,6 @@ int timespec_comp(const struct timespec *t1, const struct timespec *t2)
     return 0;
 }
 
-
 int timespec_is_negative(const struct timespec *t)
 {
     if (t->tv_sec < 0 || t->tv_nsec < 0)
@@ -199,7 +196,6 @@ int timespec_is_negative(const struct timespec *t)
     return FALSE;
 }
 
-
 void endlog(void)
 {
     if (par.logfile != NULL)
@@ -208,7 +204,6 @@ void endlog(void)
         par.logfile = NULL;
     }
 }
-
 
 void startlog(const char *filename)
 {
@@ -225,7 +220,6 @@ void startlog(const char *filename)
     }
 }
 
-
 // Show help
 void help()
 {
@@ -237,6 +231,10 @@ void help()
            "--- help         : show this help\n"
            "--- on           : connect the cable and data is exchanged (default state)\n"
            "--- off          : disconnect the cable disabling data to be exchanged\n"
+           "--- tx2rx-on     : enable Tx -> Rx direction (data frames)\n"
+           "--- tx2rx-off    : disable Tx -> Rx direction (data frames)\n"
+           "--- rx2tx-on     : enable Rx -> Tx direction (RR/REJ acknowledgements)\n"
+           "--- rx2tx-off    : disable Rx -> Tx direction (RR/REJ acknowledgements)\n"
            "--- ber <ber>    : add noise to data bits at a specified BER (default=0)\n"
            "--- baud <rate>  : set baud rate, between 1200 and 115200 (default=9600)\n"
            "                   note that 10 bits are sent per byte (8-N-1)\n"
@@ -249,6 +247,13 @@ void help()
            "\n"
            "IMPORTANT: Changing the baud rate or propagation delay while a transmission is\n"
            "           ongoing will result in losses.\n"
+           "\n"
+           "NEW COMMANDS FOR TEST 6:\n"
+           "  To simulate duplicate frames:\n"
+           "  1. Start transmission normally\n"
+           "  2. Type: rx2tx-off    (blocks acknowledgements, causing retransmissions)\n"
+           "  3. Wait a few seconds\n"
+           "  4. Type: rx2tx-on     (receiver gets duplicate frames)\n"
            "\n");
 }
 
@@ -345,11 +350,24 @@ int main(int argc, char *argv[])
         int bytesFromRx = read(fdRx, par.rx2tx + par.rx2txIdx, 1);
         par.rx2txValid[par.rx2txIdx] = bytesFromRx > 0;
 
+        // MODIFICADO: Controle individual de direções
         if (!par.cableOn)
         {
             // Ignore what was read
             par.tx2rxValid[par.tx2rxIdx] = 0;
             par.rx2txValid[par.rx2txIdx] = 0;
+        }
+        else
+        {
+            // Controle individual
+            if (!par.tx2rxOn)
+            {
+                par.tx2rxValid[par.tx2rxIdx] = 0;
+            }
+            if (!par.rx2txOn)
+            {
+                par.rx2txValid[par.rx2txIdx] = 0;
+            }
         }
 
         if (par.logfile != NULL)  // Currently logging
@@ -378,7 +396,8 @@ int main(int argc, char *argv[])
 
         if (par.cableOn)
         {
-            if (par.tx2rxValid[par.tx2rxIdx])
+            // MODIFICADO: Verifica tx2rxOn antes de transmitir Tx -> Rx
+            if (par.tx2rxOn && par.tx2rxValid[par.tx2rxIdx])
             {
                 // Add error, if applicable
                 if (par.byteER != 0.0 && (double) rand() / (double) RAND_MAX < par.byteER)
@@ -389,7 +408,8 @@ int main(int argc, char *argv[])
                 write(fdRx, par.tx2rx + par.tx2rxIdx, 1);
             }
 
-            if (par.rx2txValid[par.rx2txIdx])
+            // MODIFICADO: Verifica rx2txOn antes de transmitir Rx -> Tx
+            if (par.rx2txOn && par.rx2txValid[par.rx2txIdx])
             {
                 // Add error, if applicable
                 if (par.byteER != 0.0 && (double) rand() / (double) RAND_MAX < par.byteER)
@@ -454,7 +474,31 @@ int main(int argc, char *argv[])
             {
                 printf("CONNECTION ON\n");
                 par.cableOn = TRUE;
+                par.tx2rxOn = TRUE;
+                par.rx2txOn = TRUE;
             }
+            // NOVOS COMANDOS
+            else if (strcmp(rxStdin, "tx2rx-off") == 0)
+            {
+                printf("Tx -> Rx DIRECTION OFF (data frames blocked)\n");
+                par.tx2rxOn = FALSE;
+            }
+            else if (strcmp(rxStdin, "tx2rx-on") == 0)
+            {
+                printf("Tx -> Rx DIRECTION ON (data frames enabled)\n");
+                par.tx2rxOn = TRUE;
+            }
+            else if (strcmp(rxStdin, "rx2tx-off") == 0)
+            {
+                printf("Rx -> Tx DIRECTION OFF (acknowledgements blocked)\n");
+                par.rx2txOn = FALSE;
+            }
+            else if (strcmp(rxStdin, "rx2tx-on") == 0)
+            {
+                printf("Rx -> Tx DIRECTION ON (acknowledgements enabled)\n");
+                par.rx2txOn = TRUE;
+            }
+            // FIM NOVOS COMANDOS
             else if (strncmp(rxStdin, "ber ", 4) == 0)
             {
                 double ber;
