@@ -50,7 +50,6 @@ static int g_timeout = 0;
 static int g_nretrans = 0;
 static uint8_t g_tx_ns = 0;      
 static uint8_t g_rx_expected = 0;
-static int g_duplicate_count = 0;
 
 // Alarm handler used for retransmissions
 static void alarm_handler(int signo) {
@@ -223,7 +222,6 @@ int llopen(LinkLayer connectionParameters) {
     g_nretrans = connectionParameters.nRetransmissions;
     g_tx_ns = 0;
     g_rx_expected = 0;
-    g_duplicate_count = 0;
 
     struct sigaction act = {0};
     act.sa_handler = alarm_handler;
@@ -329,6 +327,9 @@ int llwrite(const unsigned char *buf, int bufSize) {
 
     while (attempts < g_nretrans) {
         alarm_fired = 0;
+        
+        printf("Sending frame (seq: %d, size: %d bytes)\n", g_tx_ns, bufSize);
+        
         if (writeBytesSerialPort(frame, pos) != pos) return -1;
         alarm(g_timeout);
 
@@ -346,10 +347,10 @@ int llwrite(const unsigned char *buf, int bufSize) {
                     continue;
                 }
             } else if (rc == C_REJ0 || rc == C_REJ1) {
-                attempts++;
                 alarm(0);
                 alarm_fired = 0;
-                printf("Received REJ -> retransmitting (attempt %d)\n", attempts);
+                attempts++;
+                printf("REJ received (attempt %d/%d)\n", attempts, g_nretrans);
                 continue;
             } else if (rc == C_DISC) {
                 alarm(0);
@@ -360,10 +361,10 @@ int llwrite(const unsigned char *buf, int bufSize) {
             }
         } else {
             if (alarm_fired) {
-                attempts++;
                 alarm(0);
                 alarm_fired = 0;
-                printf("Timeout while waiting for RR/REJ -> retransmit (attempt %d)\n", attempts);
+                attempts++;
+                printf("Timeout (attempt %d/%d)\n", attempts, g_nretrans);
                 continue;
             }
             attempts++;
@@ -408,9 +409,7 @@ int llread(unsigned char *packet) {
             printf("Frame accepted (seq: %d, size: %d bytes)\n", ns, n);
             return n;
         } else {
-            g_duplicate_count++;
-            printf("Duplicated Frame Detected! Received seq:%d but expected seq:%d\n...", 
-                   g_duplicate_count, ns, g_rx_expected);
+            printf("Duplicated Frame Detected!\nReceived seq:%d but Expected seq:%d...\n", ns, g_rx_expected);
             printf("Discarding duplicate and resending RR%d.\n", g_rx_expected);
             
             unsigned char rr = (g_rx_expected) ? C_RR1 : C_RR0;
@@ -500,7 +499,7 @@ int llclose() {
             int r = read_su(A_RX, &rc);
             if (r < 0) continue;
             if (rc == C_UA) {
-                printf("UA received.\n");
+                printf("UA received.\n\n");
                 break;
             }
         }
