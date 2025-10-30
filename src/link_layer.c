@@ -39,6 +39,9 @@
 #endif
 #define MAX_FRAME_SIZE (2*MAX_PAYLOAD_SIZE + 64)
 
+
+#define FLUSH_LIMIT 10000
+
 // Globals
 volatile int STOP = 0;
 static volatile sig_atomic_t alarm_fired = 0;
@@ -49,7 +52,7 @@ static int g_nretrans = 0;
 static uint8_t g_tx_ns = 0;      
 static uint8_t g_rx_expected = 0;
 
-// Alarm handler used for retransmissions -- async-signal-safe (only sets flag)
+// Alarm handler used for retransmissions
 static void alarm_handler(int signo) {
     (void)signo;
     alarm_fired = 1;
@@ -146,7 +149,6 @@ static int read_su(uint8_t expectedA, uint8_t *Cout) {
     return -1;
 }
 
-// Flush extra (for ressincronização)
 static void flush_until_flag() {
     unsigned char b;
     int flushCount = 0;
@@ -154,14 +156,12 @@ static void flush_until_flag() {
         int r = readByteSerialPort(&b);
         if (r <= 0) break;
         flushCount++;
-    } while (b != FLAG && flushCount < 1000); // Limita flushing a 1000 bytes
+    } while (b != FLAG && flushCount < FLUSH_LIMIT);
 }
 
-// Read an I-frame: robusto contra desalinhamento
-// Read an I-frame: robusto contra desalinhamento
+// Read an I-frame:
 static int read_iframe(uint8_t expectedA, uint8_t *Cout, unsigned char *out, int outcap) {
     unsigned char b;
-    // Procura pelo FLAG inicial
     while (1) {
         int r = readByteSerialPort(&b);
         if (r < 0) return -1;
@@ -195,7 +195,7 @@ static int read_iframe(uint8_t expectedA, uint8_t *Cout, unsigned char *out, int
     unsigned char destuffed[MAX_FRAME_SIZE];
     int dlen = destuff(body + 3, stuffed_len, destuffed, sizeof(destuffed));
     if (dlen < 1) { flush_until_flag(); return -1; }
-    int payload_len = dlen - 1; // last byte is BCC2
+    int payload_len = dlen - 1;
     unsigned char recv_bcc2 = destuffed[payload_len];
     unsigned char calc_bcc2 = bcc2(destuffed, payload_len);
     if (calc_bcc2 != recv_bcc2) { flush_until_flag(); return -1; }
@@ -387,6 +387,7 @@ int llread(unsigned char *packet) {
         if (n < 0) {
             unsigned char rej = (g_rx_expected == 0) ? C_REJ0 : C_REJ1;
             send_su(A_RX, rej);
+            printf("REJ sent (expected seq: %d)\n", g_rx_expected);
             rejCount++;
             if (rejCount > 10) {
                 fprintf(stderr, "Too many REJ sent, aborting connection...\n");
